@@ -1,162 +1,136 @@
-"""
-Минимальный HTTP API для предсказания направления взгляда.
-Эндпоинты:
-  GET  /health
-  POST /predict { "image_path": "..."} или { "image_b64": "..." }
-"""
-from __future__ import annotations
-
-import argparse
-import base64
-import io
-import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any, Dict
-
-import joblib
-import mediapipe as mp
-import numpy as np
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from PIL import Image
-
-from features import extract_eye_features, gaze_to_zone
-
-BASE = Path(__file__).parent
-MODEL_NAMES = ["face_landmarker_v2_with_blendshapes.task", "face_landmarker.task"]
-
-
-def _get_model_path() -> Path | None:
-    """MediaPipe не поддерживает кириллицу в путях — используем копию в корне."""
-    target = BASE / "face_landmarker.task"
-    if target.exists():
-        return target
-    for name in MODEL_NAMES:
-        src = BASE / "шаблон" / name
-        if src.exists():
-            import shutil
-
-            shutil.copy(src, target)
-            return target
-    return None
-
-
-def _load_models() -> Dict[str, Any]:
-    """Загружает модели и детектор; бросает исключение при отсутствии файлов."""
-    model_dir = BASE if (BASE / "gaze_model_h.pkl").exists() else BASE / "шаблон"
-    for fname in ["gaze_model_h.pkl", "gaze_model_v.pkl", "gaze_scaler.pkl"]:
-        if not (model_dir / fname).exists():
-            raise FileNotFoundError(f"Файл {fname} не найден. Сначала запустите train.py")
-
-    model_h = joblib.load(model_dir / "gaze_model_h.pkl")
-    model_v = joblib.load(model_dir / "gaze_model_v.pkl")
-    scaler = joblib.load(model_dir / "gaze_scaler.pkl")
-
-    model_path = _get_model_path()
-    if not model_path:
-        raise FileNotFoundError("face_landmarker.task не найден в папке проекта")
-
-    opts = vision.FaceLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=str(model_path)),
-        num_faces=1,
+# Минимальный HTTP API для предсказания взгляда. # Описание файла
+import argparse  # Аргументы CLI
+import base64  # Base64 кодирование
+import io  # Буфер для изображений
+import json  # JSON формат
+from http.server import BaseHTTPRequestHandler  # HTTP обработчик
+from http.server import ThreadingHTTPServer  # HTTP сервер
+from pathlib import Path  # Пути
+# 
+import joblib  # Сохранение моделей
+import mediapipe as mp  # MediaPipe
+import numpy as np  # Математика
+from mediapipe.tasks import python  # Опции MediaPipe
+from mediapipe.tasks.python import vision  # Задачи vision
+from PIL import Image  # Работа с изображениями
+# 
+from features import extract_eye_features, gaze_to_zone  # Признаки и зоны
+# 
+BASE = Path(__file__).parent  # База проекта
+# 
+# Возвращает путь к модели детектора. 
+def _get_model_path() -> Path:  # Путь модели
+    target = BASE / "face_landmarker.task"  # Целевой файл
+    if target.exists():  # Если есть файл
+        return target  # Возврат пути
+    src = BASE / "шаблон" / "face_landmarker.task"  # Источник
+    if src.exists():  # Если есть копия
+        import shutil  # Копирование файла
+# 
+        shutil.copy(src, target)  # Копируем модель
+    return target  # Возврат пути
+# 
+# Загружает модели регрессии и детектор лица. 
+def _load_models() -> dict:  # Загрузка моделей
+    model_dir = BASE / "out" / "models"  # Папка моделей
+    model_h = joblib.load(model_dir / "model_h.pkl")  # Модель H
+    model_v = joblib.load(model_dir / "model_v.pkl")  # Модель V
+    scaler = joblib.load(model_dir / "scaler.pkl")  # Скалер
+# 
+    model_path = _get_model_path()  # Путь к модели детектора
+    base_opts = python.BaseOptions(  # Базовые опции
+        model_asset_path=str(model_path),  # Путь модели
     )
-    detector = vision.FaceLandmarker.create_from_options(opts)
-
-    return {"model_h": model_h, "model_v": model_v, "scaler": scaler, "detector": detector}
-
-
-class GazeAPIHandler(BaseHTTPRequestHandler):
-    """Обработчик HTTP запросов. Контекст хранится в server.context."""
-
-    def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/health":
-            self._send_json({"status": "ok"})
-        else:
-            self._send_json({"error": "Not found"}, status=404)
-
-    def do_POST(self) -> None:  # noqa: N802
-        if self.path != "/predict":
-            self._send_json({"error": "Not found"}, status=404)
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length > 0 else b""
-        try:
-            data = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            self._send_json({"error": "Invalid JSON"}, status=400)
-            return
-
-        try:
-            img = _load_image(data)
-        except Exception as exc:  # noqa: BLE001 - возвращаем текст ошибки клиенту
-            self._send_json({"error": str(exc)}, status=400)
-            return
-
-        ctx = self.server.context  # type: ignore[attr-defined]
-        rgb = np.ascontiguousarray(np.array(img))
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        res = ctx["detector"].detect(mp_img)
-
-        if not res.face_landmarks:
-            self._send_json({"error": "Face not detected"}, status=422)
-            return
-
-        feat = extract_eye_features(res.face_landmarks[0])
-        if feat is None:
-            self._send_json({"error": "Invalid landmarks"}, status=422)
-            return
-
-        X = np.array([feat["features"]])
-        Xs = ctx["scaler"].transform(X)
-        h = float(ctx["model_h"].predict(Xs)[0])
-        v = float(ctx["model_v"].predict(Xs)[0])
-        zone = gaze_to_zone(h, v)
-
-        self._send_json({"h_deg": h, "v_deg": v, "zone": zone})
-
-
-def _load_image(data: Dict[str, Any]) -> Image.Image:
-    """Загружает изображение из пути (внутри проекта) или base64."""
-    if "image_path" in data:
-        path = Path(data["image_path"]).resolve()
-        base_res = BASE.resolve()
-        # Запрет path traversal: файл должен быть внутри директории проекта
-        if not path.is_file() or base_res not in path.parents:
-            raise ValueError("Допустимы только пути к файлам внутри директории проекта")
-        return Image.open(path).convert("RGB")
-
-    if "image_b64" in data:
-        raw = base64.b64decode(data["image_b64"])
-        return Image.open(io.BytesIO(raw)).convert("RGB")
-
-    raise ValueError("Нужен image_path или image_b64")
-
-
-def run(host: str = "127.0.0.1", port: int = 8000) -> None:
-    context = _load_models()
-    server = ThreadingHTTPServer((host, port), GazeAPIHandler)
-    server.context = context  # type: ignore[attr-defined]
-    print(f"API запущен: http://{host}:{port}")
-    server.serve_forever()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="HTTP API для распознавания взгляда")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    run(args.host, args.port)
-
-
-if __name__ == "__main__":
-    main()
+    opts = vision.FaceLandmarkerOptions(  # Опции детектора
+        base_options=base_opts,  # База
+        num_faces=1,  # Одно лицо
+    )
+    detector = vision.FaceLandmarker.create_from_options(opts)  # Детектор
+# 
+    return {  # Контекст сервера
+        "model_h": model_h,  # Модель H
+        "model_v": model_v,  # Модель V
+        "scaler": scaler,  # Скалер
+        "detector": detector,  # Детектор
+    }
+# 
+# Обработчик HTTP запросов для API. 
+class GazeAPIHandler(BaseHTTPRequestHandler):  # Класс хендлера
+    # Отправляет JSON ответ. 
+    def _send_json(self, payload: dict, status: int = 200) -> None:  # Ответ
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")  # Тело
+        self.send_response(status)  # Код ответа
+        content_type = "application/json; charset=utf-8"  # Тип
+        self.send_header("Content-Type", content_type)  # Тип
+        self.send_header("Content-Length", str(len(body)))  # Длина
+        self.end_headers()  # Конец заголовков
+        self.wfile.write(body)  # Запись ответа
+# 
+    def do_GET(self) -> None:  # noqa: N802 # GET запрос
+        if self.path == "/health":  # Проверка пути
+            self._send_json({"status": "ok"})  # Ответ OK
+            return  # Выход
+        self._send_json({"error": "Not found"}, status=404)  # 404
+# 
+    def do_POST(self) -> None:  # noqa: N802 # POST запрос
+        if self.path != "/predict":  # Проверка пути
+            self._send_json({"error": "Not found"}, status=404)  # 404
+            return  # Выход
+# 
+        length = int(self.headers.get("Content-Length", "0"))  # Длина тела
+        raw = self.rfile.read(length) if length > 0 else b""  # Данные
+        data = json.loads(raw.decode("utf-8"))  # Парсинг JSON
+        img = _load_image(data)  # Картинка
+# 
+        ctx = self.server.context  # type: ignore[attr-defined] # Контекст
+        rgb = np.ascontiguousarray(np.array(img))  # RGB массив
+        mp_img = mp.Image(  # MP Image
+            image_format=mp.ImageFormat.SRGB,  # Формат
+            data=rgb,  # Данные
+        )
+        res = ctx["detector"].detect(mp_img)  # Детект лица
+# 
+        if not res.face_landmarks:  # Нет лендмарков
+            err = {"error": "Face not detected"}  # Текст ошибки
+            self._send_json(err, status=422)  # Ошибка
+            return  # Выход
+# 
+        feat = extract_eye_features(res.face_landmarks[0])  # Признаки
+        if feat is None:  # Невалидные признаки
+            err = {"error": "Invalid landmarks"}  # Текст ошибки
+            self._send_json(err, status=422)  # Ошибка
+            return  # Выход
+# 
+        X = np.array([feat["features"]])  # Вектор признаков
+        Xs = ctx["scaler"].transform(X)  # Масштабирование
+        h = float(ctx["model_h"].predict(Xs)[0])  # Прогноз H
+        v = float(ctx["model_v"].predict(Xs)[0])  # Прогноз V
+        zone = gaze_to_zone(h, v)  # Зона взгляда
+# 
+        self._send_json({"h_deg": h, "v_deg": v, "zone": zone})  # Ответ
+# 
+# Загружает изображение из base64. 
+def _load_image(data: dict) -> Image.Image:  # Декодирование
+    raw = base64.b64decode(data["image_b64"])  # Base64 -> bytes
+    return Image.open(io.BytesIO(raw)).convert("RGB")  # PIL -> RGB
+# 
+# Запускает HTTP сервер API. 
+def run(host: str = "127.0.0.1", port: int = 8000) -> None:  # Запуск
+    context = _load_models()  # Модели и детектор
+    server = ThreadingHTTPServer((host, port), GazeAPIHandler)  # Сервер
+    server.context = context  # type: ignore[attr-defined] # Контекст
+    print(f"API запущен: http://{host}:{port}")  # Сообщение
+    server.serve_forever()  # Основной цикл
+# 
+# Разбор аргументов и запуск. 
+def main() -> None:  # CLI точка входа
+    parser = argparse.ArgumentParser(  # Парсер
+        description="HTTP API для распознавания взгляда",  # Описание
+    )
+    parser.add_argument("--host", default="127.0.0.1")  # Хост
+    parser.add_argument("--port", type=int, default=8000)  # Порт
+    args = parser.parse_args()  # Аргументы
+    run(args.host, args.port)  # Запуск
+# 
+if __name__ == "__main__":  # Запуск как скрипта
+    main()  # Вызов main
